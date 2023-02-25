@@ -18,18 +18,19 @@
 #include <complex.h>
 #include <inttypes.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <threads.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 #define COLOR_DEPTH 3
 #define MANDELBROT_ESCAPE 4
+#define THREAD_COUNT 30
 
 
 struct rgb {
@@ -83,8 +84,8 @@ struct fractal_definition {
 	const int_fast32_t rows;
 	const int_fast32_t cols;
 	const double complex center;
-	double width;
-	int_fast32_t steps;
+	const double width;
+	const int_fast32_t steps;
 };
 
 int_fast32_t mandelbrot(const double complex c, const int_fast32_t steps)
@@ -99,22 +100,30 @@ int_fast32_t mandelbrot(const double complex c, const int_fast32_t steps)
 	return 0;
 }
 
-void compute_colors(const struct fractal_definition *const fractal, uint8_t *result)
+struct frame {
+	int_fast32_t frame_number;
+	double zoom_speed;
+	const struct fractal_definition *fractal;
+};
+
+void compute_colors(const struct frame *const f, uint8_t *result)
 {
-	const double aspect_ratio = fractal->width / fractal->cols;
-	const double center_real = creal(fractal->center);
+	const double new_width = f->fractal->width * pow(f->zoom_speed, f->frame_number);
+	const double resolution = new_width / f->fractal->cols;
+	const double center_real = creal(f->fractal->center);
+	const double center_imag = cimag(f->fractal->center);
 	double complex c;
 	double c_imag;
 
 	int_fast32_t steps_till_escaped;
 	struct rgb rgb_color;
 
-	for (double y = 0; y < fractal->rows; y++) {
-		printf("y = %g out of %" PRIuFAST32 "\n", y + 1, (*fractal).rows);
-		c_imag = aspect_ratio * (y - (fractal->rows - 1) / 2.0);
-		for (double x = 0; x < fractal->cols; x++) {
-			c = aspect_ratio * x - fractal->width * 0.5 + center_real + c_imag * I;
-			if ((steps_till_escaped = mandelbrot(c, fractal->steps))) {
+	for (double y = 0; y < f->fractal->rows; y++) {
+		c_imag = resolution * (y - (f->fractal->rows - 1) / 2.0) + center_imag;
+		for (double x = 0; x < f->fractal->cols; x++) {
+			c = resolution * x - new_width * 0.5 + center_real + c_imag * I;
+			if ((steps_till_escaped =
+			             mandelbrot(c, f->fractal->steps + 7 * f->frame_number))) {
 				rgb_color = hue2rgb(steps_till_escaped * 3.6);
 			} else {
 				rgb_color.r = rgb_color.g = rgb_color.b = 0;
@@ -126,25 +135,49 @@ void compute_colors(const struct fractal_definition *const fractal, uint8_t *res
 	}
 }
 
-int main(int argc, char **argv)
+void *create_frame(void *args)
 {
-	char *file_name = "mandelbrot.png";
-	if (argc > 1) {
-		file_name = strcat(argv[1], ".png");
-	}
+	const struct frame *f = args;
+	char file_name[32];
+	sprintf(file_name, "frames/frame_%05" PRIuFAST32 ".png", f->frame_number);
 
-	struct fractal_definition fractal = {
+	uint8_t *fractal_result = malloc(f->fractal->cols * f->fractal->rows * COLOR_DEPTH);
+	compute_colors(f, fractal_result);
+	stbi_write_png(file_name, f->fractal->cols, f->fractal->rows, 3, fractal_result,
+	               f->fractal->cols * 3);
+	free(fractal_result);
+	return NULL;
+}
+
+int main(void)
+{
+	const struct fractal_definition fractal = {
 		.rows = 1080,
 		.cols = 1920,
-		.center = 0.0 + 0.0 * I,
-		.width = 4.0,
-		.steps = 100,
+		.center = -0.55166952885424866 + 0.62569262930977338 * I,
+		.width = 2.5,
+		.steps = 200,
 	};
+	const int_fast32_t max_frames = 500;
+	pthread_t t[THREAD_COUNT];
+	struct frame *frames[THREAD_COUNT];
+	mkdir("frames", 0775);
 
-	uint8_t *fractal_result = malloc(fractal.cols * fractal.rows * COLOR_DEPTH);
-	compute_colors(&fractal, fractal_result);
-	stbi_write_png(file_name, fractal.cols, fractal.rows, 3, fractal_result, fractal.cols * 3);
-	free(fractal_result);
+	for (int_fast32_t i = 0; i < max_frames / THREAD_COUNT + 1; i++) {
+		for (int_fast32_t thread = 0; thread < THREAD_COUNT; thread++) {
+			printf("frame: %ld out of %ld\n", i * THREAD_COUNT + thread + 1, THREAD_COUNT * (max_frames / THREAD_COUNT + 1));
+			frames[thread] = malloc(sizeof *frames[thread]);
+			frames[thread]->frame_number = i * THREAD_COUNT + thread;
+			frames[thread]->zoom_speed = 0.98;
+			frames[thread]->fractal = &fractal;
+			pthread_create(t + thread, NULL, create_frame, frames[thread]);
+		}
+
+		for (int_fast32_t thread = 0; thread < THREAD_COUNT; thread++) {
+			pthread_join(t[thread], NULL);
+			free(frames[thread]);
+		}
+	}
 
 	return EXIT_SUCCESS;
 }
